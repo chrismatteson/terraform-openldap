@@ -1,0 +1,135 @@
+provider "aws" {
+  region  = "us-west-1"
+}
+
+# Create LDAP
+resource "random_id" "project_tag" {
+  byte_length = 4
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+module "vpc" {
+  source = "terraform-aws-modules/vpc/aws"
+
+  name = "${random_id.project_tag.hex}-vpc"
+  cidr = "172.16.0.0/16"
+  azs  = data.aws_availability_zones.available.names
+  enable_dns_hostnames = true
+  public_subnets = [
+    for num in data.aws_availability_zones.available.names :
+    cidrsubnet("172.16.0.0/16", 8, 100 + index(data.aws_availability_zones.available.names, num))
+  ]
+
+  tags = merge(
+    var.tags,
+    {
+      "ProjectTag" = random_id.project_tag.hex
+    },
+  )
+}
+
+resource "aws_default_security_group" "default" {
+  vpc_id = module.vpc.vpc_id
+
+  ingress {
+    protocol  = -1
+    from_port = 0
+    to_port   = 0
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+
+resource "aws_ecs_cluster" "ecs" {
+  name = "${random_id.project_tag.hex}-ecs"
+}
+
+resource "aws_ecs_task_definition" "ldap" {
+  family                   = "ldap"
+  container_definitions    = file("files/ldap.json")
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = 512
+  memory                   = 1024
+  network_mode             = "awsvpc"
+  execution_role_arn       = aws_iam_role.execution.arn
+}
+
+resource "aws_iam_role" "execution" {
+  name = "${random_id.project_tag.hex}-execution_role"
+
+  assume_role_policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Action": "sts:AssumeRole",
+      "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+      },
+      "Effect": "Allow",
+      "Sid": ""
+    }
+  ]
+}
+EOF
+
+  tags = merge(
+    var.tags,
+    {
+      "ProjectTag" = random_id.project_tag.hex
+    },
+  )
+}
+
+resource "aws_iam_role_policy_attachment" "execution-attach" {
+  role       = aws_iam_role.execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_cloudwatch_log_group" "log_group" {
+  name = "ecs-log-streaming"
+
+  tags = merge(
+    var.tags,
+    {
+      "ProjectTag" = random_id.project_tag.hex
+    },
+  )
+}
+
+resource "aws_ecs_service" "ldap" {
+  name            = "ldap"
+  cluster         = aws_ecs_cluster.ecs.id
+  task_definition = aws_ecs_task_definition.ldap.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+  network_configuration {
+    subnets          = module.vpc.public_subnets
+    assign_public_ip = true
+  }
+
+# Need to wait for container to be provisioned and assigned an IP for the network
+# interface data source to be successful
+  provisioner "local-exec" {
+    command = "sleep 30"
+  }
+}
+
+data "aws_network_interface" "interface" {
+  filter {
+    name   = "subnet-id"
+    values = module.vpc.public_subnets
+  }
+
+  depends_on = [aws_ecs_service.ldap]
+}
